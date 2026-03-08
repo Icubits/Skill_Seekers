@@ -70,6 +70,11 @@ FALLBACK_MAIN_SELECTORS = [
     ".content",
     ".doc-content",
     "#main-content",
+    # JS-rendered API docs (Redoc, Swagger UI)
+    ".api-content",
+    "#redoc",
+    "#swagger-ui",
+    ".swagger-ui",
 ]
 
 
