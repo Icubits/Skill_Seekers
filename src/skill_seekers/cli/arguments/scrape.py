@@ -124,6 +124,22 @@ SCRAPE_ARGUMENTS: dict[str, dict[str, Any]] = {
     },
     # RAG chunking options (imported from common.py - see RAG_ARGUMENTS)
     # Note: RAG arguments will be merged at runtime
+    "js_render": {
+        "flags": ("--js-render", "--js"),
+        "kwargs": {
+            "dest": "js_render",
+            "action": "store_true",
+            "help": "Use Playwright headless browser for JS-rendered pages (Redoc, Swagger UI, SPAs). Requires: pip install playwright && playwright install chromium",
+        },
+    },
+    "js_auto": {
+        "flags": ("--js-auto",),
+        "kwargs": {
+            "dest": "js_auto",
+            "action": "store_true",
+            "help": "Auto-detect JS-rendered pages and fallback to Playwright when content is empty",
+        },
+    },
     "no_preserve_code_blocks": {
         "flags": ("--no-preserve-code-blocks",),
         "kwargs": {

@@ -27,6 +27,14 @@ import httpx
 import requests
 from bs4 import BeautifulSoup
 
+# Optional Playwright import for JS-rendered pages
+try:
+    from playwright.sync_api import sync_playwright
+
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 from skill_seekers.cli.config_fetcher import (
     get_last_searched_paths,
     list_available_configs,
@@ -182,6 +190,18 @@ class DocToSkillConverter:
         # Parallel scraping config
         self.workers = config.get("workers", 1)
         self.async_mode = config.get("async_mode", DEFAULT_ASYNC_MODE)
+
+        # JS rendering config (Playwright)
+        self.js_mode = config.get("js_render", False)
+        self.js_auto = config.get("js_auto", False)
+        self._playwright = None
+        self._browser = None
+        if self.js_mode and not PLAYWRIGHT_AVAILABLE:
+            logger.error(
+                "❌ --js flag requires Playwright. Install with:\n"
+                "   pip install playwright && playwright install chromium"
+            )
+            raise SystemExit(1)
 
         # State
         self.visited_urls: set[str] = set()
@@ -669,6 +689,47 @@ class DocToSkillConverter:
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(page, f, indent=2, ensure_ascii=False)
 
+    def _get_browser(self):
+        """Lazy-init Playwright browser (reused across pages)."""
+        if self._browser is None:
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch(headless=True)
+            logger.info("🌐 Playwright browser launched for JS rendering")
+        return self._browser
+
+    def _fetch_with_playwright(self, url: str, timeout: int = 30000) -> str:
+        """Fetch a page using Playwright headless browser (for JS-rendered content).
+
+        Args:
+            url: URL to fetch
+            timeout: Page load timeout in milliseconds
+
+        Returns:
+            Rendered HTML string
+        """
+        browser = self._get_browser()
+        page = browser.new_page(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        try:
+            page.goto(url, wait_until="networkidle", timeout=timeout)
+            # Extra wait for SPAs that render after network idle
+            page.wait_for_timeout(2000)
+            html = page.content()
+            return html
+        finally:
+            page.close()
+
+    def _cleanup_browser(self):
+        """Clean up Playwright browser resources."""
+        if self._browser:
+            self._browser.close()
+            self._browser = None
+        if self._playwright:
+            self._playwright.stop()
+            self._playwright = None
+
     def scrape_page(self, url: str) -> None:
         """Scrape a single page with thread-safe operations.
 
@@ -681,19 +742,45 @@ class DocToSkillConverter:
         Note:
             Uses threading locks when workers > 1 for thread safety
             Supports both HTML pages and Markdown (.md) files
+            When js_mode is True, uses Playwright for JS-rendered pages
+            When js_auto is True, falls back to Playwright if content is empty
         """
         try:
-            # Scraping part (no lock needed - independent)
-            headers = {"User-Agent": "Mozilla/5.0 (Documentation Scraper)"}
-            response = requests.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
+            use_playwright = self.js_mode
 
-            # Check if this is a Markdown file
+            # Check if this is a Markdown file (never needs JS)
             if url.endswith(".md") or ".md" in url:
+                headers = {"User-Agent": "Mozilla/5.0 (Documentation Scraper)"}
+                response = requests.get(url, headers=headers, timeout=30)
+                response.raise_for_status()
                 page = self._extract_markdown_content(response.text, url)
             else:
-                soup = BeautifulSoup(response.content, "html.parser")
-                page = self.extract_content(soup, url)
+                if use_playwright and PLAYWRIGHT_AVAILABLE:
+                    # Direct Playwright fetch
+                    html = self._fetch_with_playwright(url)
+                    soup = BeautifulSoup(html, "html.parser")
+                    page = self.extract_content(soup, url)
+                else:
+                    # Standard requests fetch
+                    headers = {"User-Agent": "Mozilla/5.0 (Documentation Scraper)"}
+                    response = requests.get(url, headers=headers, timeout=30)
+                    response.raise_for_status()
+                    soup = BeautifulSoup(response.content, "html.parser")
+                    page = self.extract_content(soup, url)
+
+                    # Auto-fallback: if content is empty and js_auto is enabled
+                    if (
+                        self.js_auto
+                        and PLAYWRIGHT_AVAILABLE
+                        and not page.get("content")
+                        and not page.get("headings")
+                    ):
+                        logger.info(
+                            "  🔄 Empty content detected, retrying with Playwright: %s", url
+                        )
+                        html = self._fetch_with_playwright(url)
+                        soup = BeautifulSoup(html, "html.parser")
+                        page = self.extract_content(soup, url)
 
             # Thread-safe operations (lock required)
             if self.workers > 1:
@@ -1210,6 +1297,9 @@ class DocToSkillConverter:
         else:
             logger.info("\n✅ Scraped %d pages", len(self.visited_urls))
             self.save_summary()
+
+        # Clean up Playwright browser if used
+        self._cleanup_browser()
 
     async def scrape_all_async(self) -> None:
         """Scrape all pages asynchronously (async/await version).
@@ -2144,6 +2234,26 @@ def get_configuration(args: argparse.Namespace) -> dict[str, Any]:
             logger.warning(
                 "⚠️  Async mode enabled but workers=1. Consider using --workers 4 for better performance"
             )
+
+    # Apply CLI override for JS rendering mode
+    if getattr(args, "js_render", False):
+        config["js_render"] = True
+        logger.info("🌐 JS rendering enabled (Playwright headless browser)")
+        if not PLAYWRIGHT_AVAILABLE:
+            logger.error(
+                "❌ Playwright not installed. Run:\n"
+                "   pip install playwright && playwright install chromium"
+            )
+            sys.exit(1)
+    if getattr(args, "js_auto", False):
+        config["js_auto"] = True
+        logger.info("🌐 JS auto-detection enabled (fallback to Playwright on empty content)")
+        if not PLAYWRIGHT_AVAILABLE:
+            logger.error(
+                "❌ Playwright not installed. Run:\n"
+                "   pip install playwright && playwright install chromium"
+            )
+            sys.exit(1)
 
     # Apply CLI override for max_pages
     if args.max_pages is not None:
